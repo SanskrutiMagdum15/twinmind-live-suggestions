@@ -5,7 +5,7 @@
 
 ## 🚀 Live Demo
 
-[Deployed URL here]
+https://twinmind-live-suggestions-three.vercel.app
 
 ---
 
