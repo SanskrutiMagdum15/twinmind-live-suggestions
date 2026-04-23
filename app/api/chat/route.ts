@@ -57,81 +57,14 @@ function normalizeSuggestionType(value: unknown): SuggestionType {
     : "";
 }
 
-function cleanQuotedText(text: string): string {
-  return text
-    .trim()
-    .replace(/^["']+/, "")
-    .replace(/["']+$/, "")
+function postProcessAnswer(answer: string): string {
+  return answer
+    .replace(/\*\*/g, "")
+    .replace(/\*/g, "")
+    .replace(/^#{1,6}\s?/gm, "")
+    .replace(/^\s*[-*]\s+/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-function ensurePrefix(answer: string, prefix: string): string {
-  const trimmed = answer.trim();
-  if (!trimmed) return trimmed;
-
-  if (trimmed.toLowerCase().startsWith(prefix.toLowerCase())) {
-    return trimmed;
-  }
-
-  return `${prefix} ${trimmed}`;
-}
-
-function postProcessAnswer(
-  answer: string,
-  inputType: InputType,
-  suggestionType: SuggestionType
-): string {
-  const trimmed = answer.trim();
-
-  if (!trimmed) {
-    return trimmed;
-  }
-
-  if (inputType !== "suggestion") {
-    return trimmed;
-  }
-
-  if (suggestionType === "question_to_ask") {
-    const lower = trimmed.toLowerCase();
-    const hasHelpfulPrefix =
-      lower.startsWith("you could ask:") ||
-      lower.startsWith("you could ask something like:");
-
-    if (hasHelpfulPrefix) {
-      return trimmed;
-    }
-
-    const cleaned = cleanQuotedText(trimmed);
-    return `You could ask: "${cleaned}"`;
-  }
-
-  if (suggestionType === "talking_point") {
-    return ensurePrefix(trimmed, "You could say:");
-  }
-
-  if (suggestionType === "answer") {
-    return ensurePrefix(trimmed, "You could say:");
-  }
-
-  if (suggestionType === "clarification") {
-    const lower = trimmed.toLowerCase();
-    const hasHelpfulPrefix =
-      lower.startsWith("you could clarify by asking:") ||
-      lower.startsWith("you could ask:");
-
-    if (hasHelpfulPrefix) {
-      return trimmed;
-    }
-
-    const cleaned = cleanQuotedText(trimmed);
-    return `You could clarify by asking: "${cleaned}"`;
-  }
-
-  if (suggestionType === "fact_check") {
-    return trimmed;
-  }
-
-  return trimmed;
 }
 
 export async function POST(req: NextRequest) {
@@ -163,38 +96,38 @@ export async function POST(req: NextRequest) {
 
     if (useMock) {
       let mockAnswer =
-        "Here are the most useful next steps based on the current discussion.";
+        "Start by identifying whether the slowdown comes from rendering, JavaScript execution, network requests, or backend response time. Once the biggest source is known, optimize that path first instead of applying broad fixes everywhere.";
 
       if (inputType === "suggestion" && suggestionType === "question_to_ask") {
         mockAnswer =
-          'You could ask: "What is the biggest source of latency right now — rendering, network calls, or expensive JavaScript on the main thread?"';
+          "Ask this to narrow the bottleneck: “Which part of the experience feels slow — initial page load, clicking or interacting with the UI, or background data updates?” This helps separate frontend rendering issues from API or infrastructure latency.";
       } else if (
         inputType === "suggestion" &&
         suggestionType === "talking_point"
       ) {
         mockAnswer =
-          'You could say: "We should separate whether this is actual backend latency or perceived UI latency, because the fixes may be very different."';
+          "A strong way to frame this is to separate real latency from perceived latency. Real latency may require backend or database improvements, while perceived latency can often be improved with loading states, caching, prefetching, or optimistic UI.";
       } else if (inputType === "suggestion" && suggestionType === "answer") {
         mockAnswer =
-          'You could say: "A practical next step is to profile the slow path first, then prioritize the biggest latency contributor instead of optimizing everything at once."';
+          "A practical next step is to run a Lighthouse audit and inspect Web Vitals like LCP, INP, and TTFB. Then target the largest bottleneck first, such as reducing JavaScript execution, deferring non-critical scripts, caching static assets, or optimizing slow API calls.";
       } else if (
         inputType === "suggestion" &&
         suggestionType === "clarification"
       ) {
         mockAnswer =
-          'You could clarify by asking: "When you say UI latency, are we talking about slow page load, delayed interactions, or visual jank during updates?"';
+          "The unclear part is what kind of latency the team means. Clarify whether they are talking about slow initial load, delayed user interactions, expensive background sync, or backend response time, because each one needs a different fix.";
       } else if (
         inputType === "suggestion" &&
         suggestionType === "fact_check"
       ) {
         mockAnswer =
-          "From the transcript alone, the latency concern is clear, but the exact root cause is still uncertain and needs confirmation.";
+          "The transcript supports that latency is a concern, but it does not yet prove the root cause. Before committing to a fix, validate the claim with measurements such as Lighthouse, browser performance traces, API timing logs, and p95 or p99 backend latency.";
       } else if (inputType === "manual") {
         mockAnswer =
-          "The best next step is to identify whether the slowdown is caused by rendering, JavaScript execution, network requests, or layout shifts, because that determines which optimization will actually help.";
+          "Latency is the delay between a user action and the visible response. To reduce it, first measure where the delay comes from, then optimize the biggest source: frontend rendering, JavaScript execution, network calls, database queries, or backend processing.";
       }
 
-      return NextResponse.json({ answer: mockAnswer });
+      return NextResponse.json({ answer: postProcessAnswer(mockAnswer) });
     }
 
     const transcriptText = getRecentTranscriptText(transcript, 5);
@@ -206,7 +139,7 @@ You are a live AI meeting copilot helping a user during an ongoing conversation.
 You are NOT a participant in the conversation.
 You do NOT speak as the other person.
 You do NOT continue the conversation on behalf of someone else.
-You only help the user decide what to say next or understand what was said.
+You help the user understand what was said, decide what to say next, or get a deeper answer after clicking a suggestion.
 
 You will receive:
 - inputType: "suggestion" or "manual"
@@ -216,68 +149,63 @@ You will receive:
 - recent chat history
 
 Core rules:
-- Always respond from the user's perspective.
-- Never act as the other speaker.
-- Never answer as though you are the other person in the meeting.
 - Use transcript context first.
-- Keep the answer concise, practical, natural, and useful in a live conversation.
-- Avoid generic AI openings like "Sure", "Certainly", or "Here’s a response".
-- Prefer direct wording the user can immediately say or use.
-- If context is incomplete, say what is known and what still needs clarification.
-- Be careful with uncertainty and factual claims.
-- Usually keep the response to 1-3 short paragraphs.
-- Optimize for live usefulness, not completeness.
-- Do not restate the whole transcript.
+- Be concise, practical, and useful in a live conversation.
+- Avoid generic openings like "Sure", "Certainly", or "Here’s a response".
+- Do not restate the full transcript.
 - Do not over-explain.
+- Do not invent facts that are not supported by the transcript.
+- If context is incomplete, say what is known and what still needs clarification.
+- The response should be clearly more useful than the clicked preview.
 
-Behavior:
-- If inputType is "manual":
-  - Treat this like a normal user question or request.
-  - Answer directly and clearly.
-  - DO NOT default to "You could say" or "You could ask".
-  - Only use a speakable format if the user explicitly asks for phrasing help.
-  - If the input is vague, infer intent from context and provide the most useful direct answer.
+Formatting rules:
+- Write in clean plain text only.
+- Do NOT use markdown formatting like **bold**, *, #, or markdown headings.
+- Do NOT use markdown bullet symbols like "-" or "*".
+- Do NOT include section titles wrapped in symbols.
+- If structure is helpful, use short paragraphs or numbered steps like 1., 2., 3.
+- Keep the response visually clean and product-like.
 
-- If inputType is "suggestion":
-  - Expand the clicked suggestion in the most useful way for the user.
-  - Do NOT repeat the clicked suggestion verbatim.
-  - Do NOT simply paraphrase it with tiny wording changes.
-  - The response must be more useful than the preview.
-  - Make it sound natural in a real meeting.
-  - Either sharpen it into a better question, make it more speakable, or add one practical layer of detail.
-  - Keep it concise.
+For manual user messages:
+- Answer the user directly.
+- Do not default to "You could say" or "You could ask".
+- If the manual message asks for phrasing help, then give speakable wording.
+- If the manual message asks a factual or technical question, give the answer directly.
 
-- If suggestionType is "question_to_ask":
-  - Do NOT answer the question.
-  - Do NOT roleplay the other person.
-  - Generate exactly what the user could ask next.
-  - Preserve the core intent of the clicked suggestion.
-  - Prefer rewriting or sharpening the same question rather than changing it into a different downstream request.
-  - Do NOT jump ahead to a later-stage question unless the original suggestion clearly requires it.
-  - Prefer starting with: You could ask:
-  - Keep it natural, conversational, and ready to speak.
+For clicked suggestions:
+- Do NOT repeat the clicked suggestion verbatim.
+- Do NOT merely paraphrase the clicked suggestion.
+- Expand it with NEW value.
+- Add at least one of the following:
+  reasoning, concrete steps, tradeoffs, examples, risks, a short action plan, or what to measure or verify.
+- Keep the response to 1-3 short paragraphs or a short numbered list.
+- The answer should feel like a useful expanded explanation, not just cleaned-up wording.
 
-- If suggestionType is "talking_point":
-  - Turn it into a polished point the user could say next.
-  - Preserve the original point rather than changing the topic.
-  - Prefer starting with: You could say:
-  - Add slight practical framing when helpful.
+Behavior by suggestion type:
+- question_to_ask:
+  - Explain why the question matters and what information it would unlock.
+  - Provide a sharper version of the question only if helpful.
+  - Do not only reword the question.
 
-- If suggestionType is "answer":
-  - Give a concise answer the user could say.
-  - Stay aligned with the exact question or request.
-  - Prefer starting with: You could say:
-  - Make it more useful than the preview by adding clarity or a practical next step if appropriate.
+- talking_point:
+  - Expand the point with reasoning, context, or a practical next step.
+  - Make it useful enough that the user understands why to say it.
 
-- If suggestionType is "clarification":
-  - Briefly identify what is unclear.
-  - Suggest a natural follow-up the user could ask next.
-  - Prefer directly usable conversational wording.
-  - Prefer starting with: You could clarify by asking:
+- answer:
+  - Give a stronger answer than the preview.
+  - Add explanation, steps, tradeoffs, or examples.
 
-- If suggestionType is "fact_check":
-  - Distinguish between what is supported by the transcript and what is uncertain.
-  - Keep it short, grounded, and non-speculative.
+- clarification:
+  - Identify what is unclear.
+  - Explain why that detail matters.
+  - Suggest the most useful clarification to ask.
+
+- fact_check:
+  - Separate what is supported by the transcript from what is uncertain.
+  - Suggest how to verify the claim if needed.
+
+Only use "You could ask:" or "You could say:" if the user specifically needs speakable wording.
+Otherwise, provide a helpful expanded answer with details.
 `.trim();
 
     const userPrompt = `
@@ -293,10 +221,10 @@ ${transcriptText || "No transcript provided."}
 Recent chat history:
 ${recentChat || "No previous chat."}
 
-Clicked prompt or user message:
+Clicked suggestion or user message:
 ${prompt}
 
-Generate the most useful response for the user now.
+Generate the most useful expanded response for the user now.
 `.trim();
 
     const response = await fetch(
@@ -309,7 +237,7 @@ Generate the most useful response for the user now.
         },
         body: JSON.stringify({
           model: "openai/gpt-oss-120b",
-          temperature: 0.15,
+          temperature: 0.2,
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: userPrompt },
@@ -336,7 +264,7 @@ Generate the most useful response for the user now.
       );
     }
 
-    const answer = postProcessAnswer(rawAnswer, inputType, suggestionType);
+    const answer = postProcessAnswer(rawAnswer);
 
     return NextResponse.json({ answer });
   } catch (error) {

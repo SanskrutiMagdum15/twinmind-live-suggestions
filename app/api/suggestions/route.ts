@@ -27,7 +27,7 @@ function normalize(text: string) {
   return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function getRecentTranscriptText(transcript: TranscriptChunk[], maxChunks = 3) {
+function getRecentTranscriptText(transcript: TranscriptChunk[], maxChunks = 4) {
   return transcript
     .slice(-maxChunks)
     .map((chunk, index) => `[Chunk ${index + 1}] ${chunk.text}`)
@@ -42,7 +42,10 @@ function dedupeSuggestions(items: Suggestion[]) {
     const key = normalize(item.preview);
     if (!seen.has(key)) {
       seen.add(key);
-      result.push(item);
+      result.push({
+        type: item.type,
+        preview: item.preview.trim(),
+      });
     }
   }
 
@@ -58,7 +61,7 @@ function isValidSuggestion(item: unknown): item is Suggestion {
     ALLOWED_TYPES.has(maybe.type) &&
     typeof maybe.preview === "string" &&
     maybe.preview.trim().length >= 12 &&
-    maybe.preview.trim().length <= 220
+    maybe.preview.trim().length <= 260
   );
 }
 
@@ -67,77 +70,71 @@ function detectIntent(transcript: TranscriptChunk[]) {
     .map((chunk) => chunk.text.toLowerCase())
     .join(" ");
 
-  const recommendationRequest =
-    /\b(best|good|top|recommend|recommendation|suggest|suggestion|options|places|spot|restaurant|bakery|cake|coffee|pizza|dessert|brunch|itinerary|plan|day out|visit|where should|what should)\b/.test(
+  const hasQuestionMark = joined.includes("?");
+
+  const directAsk =
+    hasQuestionMark ||
+    /\b(what is|what are|how do|how can|how should|why is|why are|where can|where should|can you|could you|should we|do we|is it|are there|tell me|give me|explain|help me)\b/.test(
       joined
     );
 
-  const directAsk =
-    /\b(tell me|give me|help me find|can you help|what is the best|what are the best|where can i|where should i)\b/.test(
+  const recommendationRequest =
+    /\b(best|good|top|recommend|recommendation|suggest|suggestion|options|places|spot|restaurant|bakery|cake|coffee|pizza|dessert|brunch|itinerary|plan|visit|where should|what should)\b/.test(
+      joined
+    );
+
+  const technicalQuestion =
+    /\b(latency|performance|scale|scaling|backend|frontend|api|database|cache|caching|websocket|kafka|nats|queue|server|deployment|architecture|cost|failure mode|reliability|p95|p99)\b/.test(
       joined
     );
 
   const planningRequest =
-    /\b(plan|itinerary|day out|with my family|outing|things to do|visit)\b/.test(
+    /\b(plan|itinerary|day out|with my family|outing|things to do|visit|schedule)\b/.test(
+      joined
+    );
+
+  const uncertainClaim =
+    /\b(i read|i heard|apparently|is it true|fact check|not sure|concerned|worried|avoid that pattern)\b/.test(
       joined
     );
 
   const constrained =
-    /\b(neighborhood|area|budget|price|cheap|expensive|downtown|capitol hill|slu|vegan|vegetarian|gluten-free|family|kids)\b/.test(
+    /\b(neighborhood|area|budget|price|cheap|expensive|downtown|capitol hill|slu|vegan|vegetarian|gluten-free|family|kids|volume|users|monthly|cost)\b/.test(
       joined
     );
 
   return {
-    recommendationRequest,
     directAsk,
+    recommendationRequest,
+    technicalQuestion,
     planningRequest,
+    uncertainClaim,
     constrained,
     shouldLeadWithAnswer:
-      recommendationRequest || directAsk || planningRequest,
+      directAsk || recommendationRequest || technicalQuestion || planningRequest,
   };
 }
 
 function getFallbackSuggestions(transcript: TranscriptChunk[]): Suggestion[] {
-  const lastText = transcript.slice(-1)[0]?.text?.trim().toLowerCase() || "";
   const intent = detectIntent(transcript);
-
-  if (!lastText) {
-    return [
-      {
-        type: "answer",
-        preview:
-          "Offer one concrete recommendation first so the user gets immediate value.",
-      },
-      {
-        type: "question_to_ask",
-        preview:
-          "Ask one short follow-up about budget, area, or preference only if it helps narrow options.",
-      },
-      {
-        type: "clarification",
-        preview:
-          "Clarify one missing detail that would most improve the recommendation.",
-      },
-    ];
-  }
 
   if (intent.shouldLeadWithAnswer) {
     return [
       {
         type: "answer",
         preview:
-          "Give one or two concrete recommendations first before asking follow-up questions.",
+          "Give a direct answer first, then add one practical next step instead of asking only a follow-up question.",
       },
       {
         type: "talking_point",
         preview:
-          "Explain briefly why those options are a strong fit for what the speaker asked.",
+          "Frame the key tradeoff clearly so the conversation can move toward a decision.",
       },
       {
-        type: intent.constrained ? "clarification" : "question_to_ask",
-        preview: intent.constrained
-          ? "Clarify one remaining preference only if it would meaningfully improve the recommendation."
-          : "Ask one short follow-up question to narrow the options if needed.",
+        type: intent.uncertainClaim ? "fact_check" : "question_to_ask",
+        preview: intent.uncertainClaim
+          ? "Verify the uncertain claim before using it as the basis for a decision."
+          : "Ask one targeted follow-up only if it would materially improve the answer.",
       },
     ];
   }
@@ -151,7 +148,7 @@ function getFallbackSuggestions(transcript: TranscriptChunk[]): Suggestion[] {
     {
       type: "talking_point",
       preview:
-        "Offer one practical suggestion the user could say right away.",
+        "Offer one practical point the user could say right away to keep the conversation moving.",
     },
     {
       type: "clarification",
@@ -167,11 +164,9 @@ function reorderSuggestions(
 ): Suggestion[] {
   const intent = detectIntent(transcript);
 
-  if (!intent.shouldLeadWithAnswer) {
-    return suggestions;
-  }
-
-  const priority = ["answer", "talking_point", "question_to_ask", "clarification", "fact_check"];
+  const priority = intent.shouldLeadWithAnswer
+    ? ["answer", "talking_point", "fact_check", "clarification", "question_to_ask"]
+    : ["question_to_ask", "talking_point", "clarification", "answer", "fact_check"];
 
   return [...suggestions].sort((a, b) => {
     return priority.indexOf(a.type) - priority.indexOf(b.type);
@@ -181,10 +176,17 @@ function reorderSuggestions(
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+
     const transcript = Array.isArray(body?.transcript) ? body.transcript : [];
-    const recentSuggestionPreviews = Array.isArray(body?.recentSuggestionPreviews)
-      ? body.recentSuggestionPreviews.filter((x: unknown) => typeof x === "string")
+
+    const recentSuggestionPreviews = Array.isArray(
+      body?.recentSuggestionPreviews
+    )
+      ? body.recentSuggestionPreviews.filter(
+          (x: unknown) => typeof x === "string"
+        )
       : [];
+
     const apiKey = req.headers.get("x-groq-api-key");
 
     if (!transcript.length) {
@@ -205,50 +207,47 @@ export async function POST(req: NextRequest) {
     const intent = detectIntent(transcript);
 
     if (useMock) {
-      if (intent.shouldLeadWithAnswer) {
-        return NextResponse.json({
-          suggestions: [
-            {
-              type: "answer",
-              preview:
-                "Bakery Nouveau and Deep Sea Sugar are two strong Seattle options if you want excellent chocolate cake.",
-            },
-            {
-              type: "talking_point",
-              preview:
-                "Mention one or two standout options and why each is worth considering.",
-            },
-            {
-              type: "question_to_ask",
-              preview:
-                "Ask whether they care more about neighborhood, price, or dine-in experience.",
-            },
-          ],
-        });
-      }
-
       return NextResponse.json({
-        suggestions: [
-          {
-            type: "question_to_ask",
-            preview:
-              "Ask which city or neighborhood they’ll spend most of their time in.",
-          },
-          {
-            type: "talking_point",
-            preview:
-              "Mention one strong local recommendation and briefly explain what it is known for.",
-          },
-          {
-            type: "clarification",
-            preview:
-              "Clarify whether they care more about quality, price, convenience, or atmosphere.",
-          },
-        ],
+        suggestions: intent.shouldLeadWithAnswer
+          ? [
+              {
+                type: "answer",
+                preview:
+                  "Latency is the delay between request and response; reduce it with caching, fewer round trips, and faster backend responses.",
+              },
+              {
+                type: "talking_point",
+                preview:
+                  "Start by measuring p95 and p99 latency so the team optimizes the real bottleneck, not just the visible symptom.",
+              },
+              {
+                type: "question_to_ask",
+                preview:
+                  "Are we seeing latency mostly from frontend loading, network calls, database queries, or backend processing?",
+              },
+            ]
+          : [
+              {
+                type: "question_to_ask",
+                preview:
+                  "What decision are we trying to make from this discussion?",
+              },
+              {
+                type: "talking_point",
+                preview:
+                  "Summarize the current tradeoff so everyone aligns on the next step.",
+              },
+              {
+                type: "clarification",
+                preview:
+                  "Clarify the most important missing constraint before recommending a direction.",
+              },
+            ],
       });
     }
 
-    const transcriptText = getRecentTranscriptText(transcript, 3);
+    const transcriptText = getRecentTranscriptText(transcript, 4);
+
     const priorSuggestionsText =
       recentSuggestionPreviews.length > 0
         ? recentSuggestionPreviews
@@ -257,44 +256,41 @@ export async function POST(req: NextRequest) {
         : "None";
 
     const systemPrompt = `
-You are a real-time meeting copilot generating live suggestions while a conversation is happening.
+You are a real-time AI meeting copilot. Your job is to generate live suggestions while a conversation is happening.
 
-Your job is to surface the 3 most useful next-step suggestions based on the MOST RECENT transcript context.
+Generate exactly 3 suggestions based on the most recent transcript.
 
-Important product principle:
-- If the speaker has made a clear direct request for recommendations, options, places, or a plan, do NOT lead only with clarifying questions.
-- In those cases, at least one suggestion should provide immediate value through a direct answer or recommendation.
-- Follow-up questions should help refine the answer, not block the answer.
+The suggestions must be useful immediately, even before the user clicks them.
 
-Rules:
-- Return exactly 3 suggestions.
-- Each suggestion should have a different type whenever possible.
-- Suggestions must feel timely, specific, and immediately useful.
-- The preview must provide value even if the user never clicks it.
-- Avoid generic advice, filler, or repeating what was just said.
-- Avoid repeating prior suggestions provided below.
-- Avoid repetition across batches:
-  - Do NOT repeat the same angle from recent suggestions unless it is clearly necessary.
-  - If a similar clarification was already suggested recently, choose a different angle.
-  - Each new batch should feel like a progression, not a reset.
-- Prioritize high-leverage suggestions over low-value or obvious ones.
-- Focus on what would help the user most in the next few moments of the conversation.
-- If the transcript is ambiguous, prefer one clarification, but do not overuse clarifying questions.
-- Keep each preview to 1 sentence.
-- Write previews in plain, natural language the user could speak or use right away.
-- Return valid JSON only.
+Most important behavior:
+- Do NOT generate only questions unless the transcript truly needs only follow-up questions.
+- If the speaker asks a direct question, include at least one direct ANSWER.
+- If the speaker asks for recommendations, options, a plan, or advice, include at least one direct ANSWER or specific recommendation.
+- If the speaker mentions uncertainty, risk, cost, correctness, or a claim that may need verification, consider a FACT_CHECK.
+- If the discussion is vague or missing a key detail, include one QUESTION_TO_ASK or CLARIFICATION.
+- If there is a useful thing the user could say next, include a TALKING_POINT.
 
-Suggestion mix guidance:
-- If the transcript contains a direct ask for recommendations, lists, best options, or planning help:
-  1. include one answer OR talking_point that directly helps
-  2. include one additional supporting suggestion
-  3. include at most one clarification or question_to_ask
-- If the transcript is exploratory or underspecified:
-  1. one question_to_ask
-  2. one talking_point OR answer
-  3. one clarification OR fact_check
+Choose the best mix based on context. Do not force the same mix every time.
 
-Return JSON in exactly this format:
+Suggestion quality rules:
+- Each preview must be specific to the transcript.
+- Each preview must be one sentence.
+- Each preview should be useful on its own.
+- Avoid generic advice like "consider the pros and cons."
+- Avoid repeating the transcript.
+- Avoid repeating prior suggestions.
+- Avoid asking obvious questions when a direct answer would be more helpful.
+- Make the batch feel like progress from earlier batches.
+- Keep previews concise but valuable.
+
+Allowed types:
+- "answer"
+- "talking_point"
+- "question_to_ask"
+- "clarification"
+- "fact_check"
+
+Return valid JSON only in exactly this format:
 {
   "suggestions": [
     { "type": "answer", "preview": "..." },
@@ -302,23 +298,26 @@ Return JSON in exactly this format:
     { "type": "question_to_ask", "preview": "..." }
   ]
 }
-    `.trim();
+`.trim();
 
     const userPrompt = `
 Most recent transcript context:
 ${transcriptText}
 
-Detected intent:
+Detected context:
 - shouldLeadWithAnswer: ${intent.shouldLeadWithAnswer ? "yes" : "no"}
+- directAsk: ${intent.directAsk ? "yes" : "no"}
 - recommendationRequest: ${intent.recommendationRequest ? "yes" : "no"}
+- technicalQuestion: ${intent.technicalQuestion ? "yes" : "no"}
 - planningRequest: ${intent.planningRequest ? "yes" : "no"}
+- uncertainClaim: ${intent.uncertainClaim ? "yes" : "no"}
 - alreadyConstrained: ${intent.constrained ? "yes" : "no"}
 
 Recent prior suggestion previews to avoid repeating:
 ${priorSuggestionsText}
 
-Generate the best 3 live suggestions for what would help right now.
-    `.trim();
+Generate the best 3 live suggestions for what would help the user right now.
+`.trim();
 
     const response = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
@@ -330,7 +329,7 @@ Generate the best 3 live suggestions for what would help right now.
         },
         body: JSON.stringify({
           model: "openai/gpt-oss-120b",
-          temperature: 0.2,
+          temperature: 0.25,
           response_format: { type: "json_object" },
           messages: [
             { role: "system", content: systemPrompt },
@@ -350,6 +349,7 @@ Generate the best 3 live suggestions for what would help right now.
     }
 
     const content = data?.choices?.[0]?.message?.content;
+
     if (!content) {
       return NextResponse.json(
         { suggestions: getFallbackSuggestions(transcript) },
@@ -387,6 +387,7 @@ Generate the best 3 live suggestions for what would help right now.
     return NextResponse.json({ suggestions: orderedSuggestions });
   } catch (error) {
     console.error("Suggestions route error:", error);
+
     return NextResponse.json(
       { error: "Failed to generate suggestions" },
       { status: 500 }
